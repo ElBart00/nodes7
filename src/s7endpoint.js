@@ -90,6 +90,7 @@ class S7Endpoint extends EventEmitter {
      * @param {number}  [opts.dstTSAP=0x0102] the destination TSAP, when connecting using TSAP method
      * @param {GetTransport} [opts.customTransport] allows supplying a custom function for getting a transport stream to the PLC. See {@link GetTransport}
      * @param {number}  [opts.autoReconnect=5000] the time to wait before trying to connect to the PLC again, in ms. If set to 0, disables the functionality
+     * @param {number}  [opts.connectTimeout=10000] the time to wait for the transport to connect before giving up on the attempt, in ms
      * @param {object}  [opts.s7ConnOpts] the {@link S7Connection} constructor options, allowing to fine-tune specific parameters
      * 
      * @throws {Error} Will throw an error if invalid options are passed
@@ -105,6 +106,7 @@ class S7Endpoint extends EventEmitter {
         this._getTransport = opts.customTransport || (() => this._createIsoTransport());
 
         this._autoReconnect = opts.autoReconnect !== undefined ? opts.autoReconnect : 5000;
+        this._connectTimeout = opts.connectTimeout !== undefined ? opts.connectTimeout : 10000;
         this._connOptsS7 = opts.s7ConnOpts || {};
 
         let dstTSAP;
@@ -147,6 +149,45 @@ class S7Endpoint extends EventEmitter {
         this._reconnectTimer = null;
         /** @type {boolean} */
         this._shouldConnect = false;
+        // connection attempt in progress ({aborted: boolean}) and its
+        // not-yet-connected ISO-on-TCP stream, so both can be aborted
+        this._pendingAttempt = null;
+        /** @type {Duplex} */
+        this._pendingTransport = null;
+    }
+
+    /**
+     * Destroys a stream that never became (or no longer is) this._transport
+     * @private
+     * @param {Duplex} stream
+     */
+    _destroyStream(stream) {
+        if (!stream) return;
+        if (stream.destroy) {
+            stream.destroy();
+        } else if (stream._destroy) {
+            stream._destroy(new Error(), () => { });
+        }
+    }
+
+    /**
+     * Aborts the connection attempt in progress, if any: marks it as
+     * aborted (a late transport will be destroyed instead of being used) and
+     * destroys the pending ISO-on-TCP stream right away
+     * @private
+     * @returns {boolean} whether an attempt was aborted
+     */
+    _abortPendingTransport() {
+        const attempt = this._pendingAttempt;
+        if (!attempt) return false;
+        debug("S7Endpoint _abortPendingTransport");
+
+        attempt.aborted = true;
+        this._pendingAttempt = null;
+        const stream = this._pendingTransport;
+        this._pendingTransport = null;
+        this._destroyStream(stream);
+        return true;
     }
 
     /**
@@ -175,19 +216,46 @@ class S7Endpoint extends EventEmitter {
 
         this._connectionState = CONN_CONNECTING;
 
+        // every attempt gets its own token. When the attempt times out or is
+        // aborted by a disconnect, its transport is destroyed and never becomes this._transport
+        const attempt = { aborted: false };
+        this._pendingAttempt = attempt;
+        this._pendingTransport = null;
+
+        const transportPromise = this._getTransport();
+        let timer;
+
         let race = Promise.race([
-            this._getTransport(),
-            new Promise((res, rej) => setTimeout(() => rej(new NodeS7Error('ERR_TIMEOUT', 'Timeout connecting to the transport')), 10000).unref())
+            transportPromise,
+            new Promise((res, rej) => {
+                timer = setTimeout(() => rej(new NodeS7Error('ERR_TIMEOUT', 'Timeout connecting to the transport')), this._connectTimeout);
+                timer.unref();
+            })
         ]);
 
+        // a transport that only arrives after its attempt was aborted is destroyed
+        Promise.resolve(transportPromise).then(transport => {
+            if (attempt.aborted) this._destroyStream(transport);
+        }, () => { });
+
         race.then(transport => {
+            clearTimeout(timer);
+            if (attempt.aborted) return; // destroyed by the handler above
+            this._pendingAttempt = null;
+            this._pendingTransport = null;
             this._transport = transport;
             this._transport.on('error', e => this._onTransportError(e));
             this._transport.on('close', () => this._onTransportClose());
             this._transport.on('end', () => this._onTransportEnd());
             this._createS7Connection();
             this._connection.connect();
-        }).catch(e => this._onTransportError(e));
+        }).catch(e => {
+            clearTimeout(timer);
+            if (attempt.aborted) return; // aborted by us (disconnect or a newer attempt): nothing to report
+            // timeout or connect error: destroy the half-open transport of this attempt
+            this._abortPendingTransport();
+            this._onTransportError(e);
+        });
     }
 
     /**
@@ -208,6 +276,8 @@ class S7Endpoint extends EventEmitter {
                 resolve(stream);
             });
             stream.on('error', handleRejection);
+            // keep a reference, so a timeout can destroy it before it connects
+            this._pendingTransport = stream;
         })
     }
 
@@ -254,6 +324,9 @@ class S7Endpoint extends EventEmitter {
         //if we're destroying the transport, the connection must also die
         this._destroyConnection();
 
+        // a transport that is still connecting must die too
+        this._abortPendingTransport();
+
         if (!this._transport) return;
 
         if (this._transport.destroy) {
@@ -281,6 +354,12 @@ class S7Endpoint extends EventEmitter {
         debug("S7Endpoint _closeTransport");
 
         this._connectionState = CONN_DISCONNECTED;
+
+        // disconnect while still connecting: abort the attempt and report the
+        // disconnect, otherwise disconnect() never resolves ("Close timed out" in Node-RED)
+        if (this._abortPendingTransport()) {
+            this.emit('disconnect');
+        }
 
         if (!this._transport) return;
 
@@ -378,6 +457,8 @@ class S7Endpoint extends EventEmitter {
         if (this._autoReconnect > 0) {
             this._reconnectTimer = setTimeout(() => {
                 debug("S7Endpoint _scheduleReconnection timeout-fired");
+                // no new attempt after disconnect() (timer scheduled before it)
+                if (!this._shouldConnect) return;
                 this._connect();
             }, this._autoReconnect);
         }
